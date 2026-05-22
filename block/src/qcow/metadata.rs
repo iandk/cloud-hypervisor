@@ -567,9 +567,15 @@ impl QcowState {
             self.update_cluster_addr(l1_index, l2_index, cluster_addr, &mut set_refcounts)?;
             cluster_addr
         } else {
-            // Already allocated - validate alignment
+            // Already allocated - validate alignment and bounds. A standard L2
+            // entry must point to a cluster the refcount table can describe.
+            // Corrupted metadata can yield an aligned but impossible host
+            // offset (e.g. far beyond EOF); fail loudly here instead of issuing
+            // a pwrite to that offset.
             let cluster_addr = l2_entry_std_cluster_addr(l2_entry);
-            if cluster_addr & (self.raw_file.cluster_size() - 1) != 0 {
+            if cluster_addr & (self.raw_file.cluster_size() - 1) != 0
+                || cluster_addr > self.refcounts.max_valid_cluster_offset()
+            {
                 self.set_corrupt_bit_best_effort();
                 return Err(io::Error::from_raw_os_error(EIO));
             }
