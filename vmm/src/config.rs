@@ -968,6 +968,7 @@ impl MemoryConfig {
             .add("hugepages")
             .add("hugepage_size")
             .add("prefault")
+            .add("reserve")
             .add("thp");
         parser.parse(memory).map_err(Error::ParseMemory)?;
 
@@ -1012,6 +1013,11 @@ impl MemoryConfig {
             .map_err(Error::ParseMemory)?
             .unwrap_or(Toggle(false))
             .0;
+        let reserve = parser
+            .convert::<Toggle>("reserve")
+            .map_err(Error::ParseMemory)?
+            .unwrap_or(Toggle(false))
+            .0;
         let thp = parser
             .convert::<Toggle>("thp")
             .map_err(Error::ParseMemory)?
@@ -1033,6 +1039,7 @@ impl MemoryConfig {
                     .add("hotplug_size")
                     .add("hotplugged_size")
                     .add("prefault")
+                    .add("reserve")
                     .add("mergeable");
                 parser.parse(memory_zone).map_err(Error::ParseMemoryZone)?;
 
@@ -1074,6 +1081,11 @@ impl MemoryConfig {
                     .map_err(Error::ParseMemoryZone)?
                     .unwrap_or(Toggle(false))
                     .0;
+                let reserve = parser
+                    .convert::<Toggle>("reserve")
+                    .map_err(Error::ParseMemoryZone)?
+                    .unwrap_or(Toggle(false))
+                    .0;
                 let mergeable = parser
                     .convert::<Toggle>("mergeable")
                     .map_err(Error::ParseMemoryZone)?
@@ -1091,6 +1103,7 @@ impl MemoryConfig {
                     hotplug_size,
                     hotplugged_size,
                     prefault,
+                    reserve,
                     mergeable,
                 });
             }
@@ -1109,6 +1122,7 @@ impl MemoryConfig {
             hugepages,
             hugepage_size,
             prefault,
+            reserve,
             zones,
             thp,
         })
