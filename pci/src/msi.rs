@@ -17,6 +17,7 @@ use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
 
 // MSI control masks
 const MSI_CTL_ENABLE: u16 = 0x1;
+const MSI_CTL_MULTI_MSG_CAPABLE: u16 = 0xe;
 const MSI_CTL_MULTI_MSG_ENABLE: u16 = 0x70;
 const MSI_CTL_64_BITS: u16 = 0x80;
 const MSI_CTL_PER_VECTOR: u16 = 0x100;
@@ -31,6 +32,16 @@ const MSI_MSG_ADDR_LO_MASK: u32 = 0xffff_fffc;
 pub fn msi_num_enabled_vectors(msg_ctl: u16) -> usize {
     let field = (msg_ctl >> 4) & 0x7;
 
+    msi_num_vectors_from_field(field)
+}
+
+pub fn msi_num_capable_vectors(msg_ctl: u16) -> usize {
+    let field = (msg_ctl & MSI_CTL_MULTI_MSG_CAPABLE) >> 1;
+
+    msi_num_vectors_from_field(field)
+}
+
+fn msi_num_vectors_from_field(field: u16) -> usize {
     if field > 5 {
         return 0;
     }
@@ -292,5 +303,92 @@ impl Snapshottable for MsiConfig {
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
         Snapshot::new_from_state(&self.state())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use vmm_sys_util::eventfd::EventFd;
+
+    use super::*;
+
+    struct CountingInterruptSourceGroup {
+        count: InterruptIndex,
+        updates: AtomicUsize,
+        out_of_range_updates: AtomicUsize,
+    }
+
+    impl CountingInterruptSourceGroup {
+        fn new(count: InterruptIndex) -> Self {
+            Self {
+                count,
+                updates: AtomicUsize::new(0),
+                out_of_range_updates: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl InterruptSourceGroup for CountingInterruptSourceGroup {
+        fn trigger(&self, _index: InterruptIndex) -> vm_device::interrupt::Result<()> {
+            Ok(())
+        }
+
+        fn notifier(&self, index: InterruptIndex) -> Option<EventFd> {
+            if index < self.count {
+                EventFd::new(libc::EFD_NONBLOCK).ok()
+            } else {
+                None
+            }
+        }
+
+        fn update(
+            &self,
+            index: InterruptIndex,
+            _config: InterruptSourceConfig,
+            _masked: bool,
+            _set_gsi: bool,
+        ) -> vm_device::interrupt::Result<()> {
+            self.updates.fetch_add(1, Ordering::Relaxed);
+            if index >= self.count {
+                self.out_of_range_updates.fetch_add(1, Ordering::Relaxed);
+                return Err(io::Error::other(format!("invalid interrupt index {index}")));
+            }
+
+            Ok(())
+        }
+
+        fn set_gsi(&self) -> vm_device::interrupt::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn msi_capable_vectors_are_distinct_from_reset_enabled_vectors() {
+        // Bits 3:1 advertise 32-vector capability. Bits 6:4 are reset to 0,
+        // so only one vector is enabled until the guest programs MSI control.
+        let reset_msg_ctl = 5 << 1;
+        assert_eq!(msi_num_enabled_vectors(reset_msg_ctl), 1);
+        assert_eq!(msi_num_capable_vectors(reset_msg_ctl), 32);
+
+        let concrete_group = Arc::new(CountingInterruptSourceGroup::new(msi_num_capable_vectors(
+            reset_msg_ctl,
+        )
+            as InterruptIndex));
+        let interrupt_source_group: Arc<dyn InterruptSourceGroup> = concrete_group.clone();
+        let mut msi_config = MsiConfig::new(reset_msg_ctl, interrupt_source_group, None).unwrap();
+
+        let enabled_msg_ctl = reset_msg_ctl | MSI_CTL_ENABLE | (5 << 4);
+        msi_config.update(MSI_MSG_CTL_OFFSET, &enabled_msg_ctl.to_le_bytes());
+
+        assert_eq!(msi_config.num_enabled_vectors(), 32);
+        assert_eq!(concrete_group.updates.load(Ordering::Relaxed), 32);
+        assert_eq!(
+            concrete_group.out_of_range_updates.load(Ordering::Relaxed),
+            0
+        );
+        assert!(concrete_group.notifier(31).is_some());
     }
 }

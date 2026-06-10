@@ -36,12 +36,12 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::mmap::MmapRegion;
 use crate::msi::{MSI_CONFIG_ID, MsiConfigState};
-use crate::msix::{MaybeMutInterruptSourceGroup, MsixConfigState};
+use crate::msix::{Error as MsixError, MaybeMutInterruptSourceGroup, MsixConfigState};
 use crate::{
     BarReprogrammingParams, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig, MsixCap,
     MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
     PciBdf, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
-    PciExpressCapabilityId, PciHeaderType, PciSubclass, msi_num_enabled_vectors,
+    PciExpressCapabilityId, PciHeaderType, PciSubclass, msi_num_capable_vectors,
 };
 
 pub(crate) const VFIO_COMMON_ID: &str = "vfio_common";
@@ -76,6 +76,8 @@ pub enum VfioPciError {
     RetrievePciConfigurationState(#[source] anyhow::Error),
     #[error("Failed to retrieve VfioCommonState")]
     RetrieveVfioCommonState(#[source] anyhow::Error),
+    #[error("Failed to update MSI-X interrupt routes")]
+    UpdateMsixRoutes(#[source] MsixError),
 }
 
 #[derive(Copy, Clone)]
@@ -153,32 +155,36 @@ pub(crate) struct VfioMsix {
 }
 
 impl VfioMsix {
-    fn update(&mut self, offset: u64, data: &[u8]) -> Option<InterruptUpdateAction> {
+    fn update(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Option<InterruptUpdateAction>, MsixError> {
         let old_enabled = self.bar.enabled();
 
         // Update "Message Control" word
         if offset == 2 && data.len() == 2 {
             let data = LittleEndian::read_u16(data);
-            self.bar.set_msg_ctl(data);
+            self.bar.set_msg_ctl(data)?;
             self.cap.set_msg_ctl(data);
         } else if offset == 0 && data.len() == 4 {
             // Some guests update MSI-X control through the dword config write path.
             let data = (LittleEndian::read_u32(data) >> 16) as u16;
-            self.bar.set_msg_ctl(data);
+            self.bar.set_msg_ctl(data)?;
             self.cap.set_msg_ctl(data);
         }
 
         let new_enabled = self.bar.enabled();
 
         if !old_enabled && new_enabled {
-            return Some(InterruptUpdateAction::EnableMsix);
+            return Ok(Some(InterruptUpdateAction::EnableMsix));
         }
 
         if old_enabled && !new_enabled {
-            return Some(InterruptUpdateAction::DisableMsix);
+            return Ok(Some(InterruptUpdateAction::DisableMsix));
         }
 
-        None
+        Ok(None)
     }
 
     fn table_accessed(&self, bar_index: u32, offset: u64) -> bool {
@@ -206,13 +212,17 @@ impl Interrupt {
         None
     }
 
-    fn update_msix(&mut self, offset: u64, data: &[u8]) -> Option<InterruptUpdateAction> {
+    fn update_msix(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Option<InterruptUpdateAction>, MsixError> {
         if let Some(msix) = &mut self.msix {
             let action = msix.update(offset, data);
             return action;
         }
 
-        None
+        Ok(None)
     }
 
     fn accessed(&self, offset: u64) -> Option<(PciCapabilityId, u64)> {
@@ -243,11 +253,12 @@ impl Interrupt {
         false
     }
 
-    fn msix_write_table(&mut self, offset: u64, data: &[u8]) {
+    fn msix_write_table(&mut self, offset: u64, data: &[u8]) -> Result<(), MsixError> {
         if let Some(msix) = &mut self.msix {
             let offset = offset - u64::from(msix.cap.table_offset());
-            msix.bar.write_table(offset, data);
+            msix.bar.write_table(offset, data)?;
         }
+        Ok(())
     }
 
     fn msix_read_table(&self, offset: u64, data: &mut [u8]) {
@@ -898,7 +909,7 @@ impl VfioCommon {
             .msi_interrupt_manager
             .create_group(MsiIrqGroupConfig {
                 base: 0,
-                count: msi_num_enabled_vectors(msg_ctl) as InterruptIndex,
+                count: msi_num_capable_vectors(msg_ctl) as InterruptIndex,
             })
             .unwrap();
 
@@ -1194,7 +1205,11 @@ impl VfioCommon {
     }
 
     fn update_msix_capabilities(&mut self, offset: u64, data: &[u8]) -> Result<(), VfioPciError> {
-        match self.interrupt.update_msix(offset, data) {
+        match self
+            .interrupt
+            .update_msix(offset, data)
+            .map_err(VfioPciError::UpdateMsixRoutes)?
+        {
             Some(InterruptUpdateAction::EnableMsix) => {
                 // Disable INTx before we can enable MSI-X
                 self.disable_intx();
@@ -1256,7 +1271,9 @@ impl VfioCommon {
 
             // If the MSI-X table is written to, we need to update our cache.
             if self.interrupt.msix_table_accessed(region.index, offset) {
-                self.interrupt.msix_write_table(offset, data);
+                if let Err(e) = self.interrupt.msix_write_table(offset, data) {
+                    error!("Failed updating MSI-X table: {e}");
+                }
             } else {
                 self.vfio_wrapper.region_write(region.index, offset, data);
             }
@@ -1308,11 +1325,13 @@ impl VfioCommon {
                 PciCapabilityId::MessageSignalledInterrupts => {
                     if let Err(e) = self.update_msi_capabilities(cap_offset, data) {
                         error!("Could not update MSI capabilities: {e}");
+                        return (Vec::new(), None);
                     }
                 }
                 PciCapabilityId::MsiX => {
                     if let Err(e) = self.update_msix_capabilities(cap_offset, data) {
                         error!("Could not update MSI-X capabilities: {e}");
+                        return (Vec::new(), None);
                     }
                 }
                 _ => {}

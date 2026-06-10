@@ -14,6 +14,7 @@ use std::any::Any;
 use std::collections::HashMap;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use std::mem::offset_of;
+use std::mem::size_of;
 #[cfg(feature = "sev_snp")]
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
@@ -40,6 +41,7 @@ use log::debug;
 use log::warn;
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::ioctl::ioctl_with_ptr;
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::gic::KvmGicV3Its;
@@ -111,11 +113,15 @@ use kvm_bindings::nested::KvmNestedStateBuffer;
 pub use kvm_bindings::{
     self, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_IRQ_ROUTING_IRQCHIP,
     KVM_IRQ_ROUTING_MSI, KVM_MEM_GUEST_MEMFD, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
-    KVM_MSI_VALID_DEVID, kvm_clock_data, kvm_create_device, kvm_create_device as CreateDevice,
-    kvm_device_attr as DeviceAttr, kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug,
-    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_run, kvm_userspace_memory_region,
-    kvm_userspace_memory_region2,
+    KVM_MSI_VALID_DEVID, KVMIO, kvm_clock_data, kvm_create_device,
+    kvm_create_device as CreateDevice, kvm_device_attr as DeviceAttr,
+    kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug, kvm_irq_routing, kvm_irq_routing_entry,
+    kvm_mp_state, kvm_run, kvm_userspace_memory_region, kvm_userspace_memory_region2,
 };
+
+vmm_sys_util::ioctl_iow_nr!(KVM_SET_GSI_ROUTING_DYNAMIC, KVMIO, 0x6a, kvm_irq_routing);
+#[cfg(feature = "tdx")]
+use kvm_bindings::KVM_X86_SW_PROTECTED_VM;
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
     KVM_GUESTDBG_USE_HW, KVM_NR_SPSR, KVM_REG_ARM_COPROC_MASK, KVM_REG_ARM_CORE, KVM_REG_ARM64,
@@ -125,8 +131,6 @@ use kvm_bindings::{
 };
 #[cfg(target_arch = "riscv64")]
 use kvm_bindings::{KVM_REG_RISCV_CORE, kvm_riscv_core};
-#[cfg(feature = "tdx")]
-use kvm_bindings::{KVM_X86_SW_PROTECTED_VM, KVMIO};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{Xsave as xsave2, kvm_xsave2};
 pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
@@ -584,6 +588,63 @@ pub struct KvmVm {
     memory_slots: Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
 }
 
+// Linux's in-kernel KVM limit is KVM_MAX_IRQ_ROUTES in
+// include/linux/kvm_host.h. kvm-bindings 0.14.0 caps its safe FAM wrapper at
+// 1024 entries, so build this one ioctl buffer locally to avoid truncating the
+// kernel-supported route table.
+const KVM_MAX_IRQ_ROUTES: usize = 4096;
+
+struct KvmIrqRoutingBuffer {
+    mem_allocator: Vec<kvm_irq_routing>,
+}
+
+impl KvmIrqRoutingBuffer {
+    fn mem_allocator_len(route_count: usize) -> Option<usize> {
+        let buffer_size = size_of::<kvm_irq_routing>()
+            .checked_add(route_count.checked_mul(size_of::<kvm_irq_routing_entry>())?)?;
+
+        buffer_size
+            .checked_add(size_of::<kvm_irq_routing>().checked_sub(1)?)?
+            .checked_div(size_of::<kvm_irq_routing>())
+    }
+
+    fn from_entries(entries: &[kvm_irq_routing_entry]) -> anyhow::Result<Self> {
+        if entries.len() > KVM_MAX_IRQ_ROUTES {
+            return Err(anyhow!(
+                "too many KVM IRQ routes: {} > {}",
+                entries.len(),
+                KVM_MAX_IRQ_ROUTES
+            ));
+        }
+
+        let mem_allocator_len = Self::mem_allocator_len(entries.len())
+            .ok_or_else(|| anyhow!("KVM IRQ routing buffer size overflow"))?;
+        let mut mem_allocator = Vec::with_capacity(mem_allocator_len);
+        mem_allocator.resize_with(mem_allocator_len, kvm_irq_routing::default);
+
+        // SAFETY: mem_allocator is aligned for kvm_irq_routing and sized using
+        // the same FAM layout as vmm-sys-util's FamStructWrapper. The first
+        // kvm_irq_routing header is followed by enough contiguous storage for
+        // entries.len() kvm_irq_routing_entry values.
+        unsafe {
+            let routing = mem_allocator.as_mut_ptr();
+            (*routing).nr = u32::try_from(entries.len())?;
+            (*routing).flags = 0;
+            std::ptr::copy_nonoverlapping(
+                entries.as_ptr(),
+                (*routing).entries.as_mut_ptr(),
+                entries.len(),
+            );
+        }
+
+        Ok(Self { mem_allocator })
+    }
+
+    fn as_ptr(&self) -> *const kvm_irq_routing {
+        self.mem_allocator.as_ptr()
+    }
+}
+
 impl KvmVm {
     ///
     /// Creates an emulated device in the kernel.
@@ -1009,18 +1070,33 @@ impl vm::Vm for KvmVm {
         let entries: Vec<kvm_irq_routing_entry> = entries
             .iter()
             .map(|entry| match entry {
-                IrqRoutingEntry::Kvm(e) => *e,
+                IrqRoutingEntry::Kvm(e) => Ok(*e),
                 #[allow(unreachable_patterns)]
-                _ => panic!("IrqRoutingEntry type is wrong"),
+                _ => Err(vm::HypervisorVmError::SetGsiRouting(anyhow!(
+                    "non-KVM IRQ routing entry passed to KVM VM"
+                ))),
             })
-            .collect();
+            .collect::<vm::Result<Vec<_>>>()?;
 
-        let irq_routing =
-            kvm_bindings::fam_wrappers::KvmIrqRouting::from_entries(&entries).unwrap();
+        let irq_routing = KvmIrqRoutingBuffer::from_entries(&entries)
+            .map_err(vm::HypervisorVmError::SetGsiRouting)?;
 
-        self.fd
-            .set_gsi_routing(&irq_routing)
-            .map_err(|e| vm::HypervisorVmError::SetGsiRouting(e.into()))
+        // SAFETY: irq_routing points to a valid kvm_irq_routing FAM buffer
+        // that remains alive for the duration of this ioctl call.
+        let ret = unsafe {
+            ioctl_with_ptr(
+                self.fd.as_ref(),
+                KVM_SET_GSI_ROUTING_DYNAMIC(),
+                irq_routing.as_ptr(),
+            )
+        };
+        if ret < 0 {
+            return Err(vm::HypervisorVmError::SetGsiRouting(
+                errno::Error::last().into(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Creates a guest physical memory region.
@@ -3705,6 +3781,58 @@ impl KvmVcpu {
 
 #[cfg(test)]
 mod unit_tests {
+    #[test]
+    #[cfg(feature = "kvm")]
+    fn test_kvm_irq_routing_buffer_boundary() {
+        use super::*;
+
+        let entries = vec![kvm_irq_routing_entry::default(); KVM_MAX_IRQ_ROUTES];
+        let buffer = KvmIrqRoutingBuffer::from_entries(&entries).unwrap();
+        // SAFETY: the buffer owns a valid kvm_irq_routing header.
+        unsafe {
+            assert_eq!((*buffer.as_ptr()).nr, KVM_MAX_IRQ_ROUTES as u32);
+        }
+
+        let too_many_entries = vec![kvm_irq_routing_entry::default(); KVM_MAX_IRQ_ROUTES + 1];
+        assert!(KvmIrqRoutingBuffer::from_entries(&too_many_entries).is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
+    fn test_kvm_accepts_more_than_1024_irq_routes() {
+        use super::*;
+        use crate::{HypervisorVmConfig, InterruptSourceConfig};
+
+        let Ok(hypervisor) = KvmHypervisor::new() else {
+            eprintln!("Skipping KVM IRQ routing test because /dev/kvm is unavailable");
+            return;
+        };
+        let Ok(vm) = hypervisor.create_vm(HypervisorVmConfig::default()) else {
+            eprintln!("Skipping KVM IRQ routing test because a VM could not be created");
+            return;
+        };
+        if vm.create_irq_chip().is_err() {
+            eprintln!("Skipping KVM IRQ routing test because IRQ chip creation failed");
+            return;
+        }
+
+        let route_count = 1536u32;
+        let mut entries = Vec::with_capacity(route_count as usize);
+
+        for index in 0..route_count {
+            let gsi = 32 + index;
+            let config = InterruptSourceConfig::MsiIrq(crate::MsiIrqSourceConfig {
+                high_addr: 0,
+                low_addr: 0xfee0_0000,
+                data: 0x40 + (index % 0xbf),
+                devid: 0,
+            });
+            entries.push(vm.make_routing_entry(gsi, &config));
+        }
+
+        vm.set_gsi_routing(&entries).unwrap();
+    }
+
     #[test]
     #[cfg(target_arch = "riscv64")]
     fn test_get_and_set_regs() {

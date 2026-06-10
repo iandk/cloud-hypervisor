@@ -35,6 +35,9 @@ pub enum Error {
     /// Failed enabling the interrupt route.
     #[error("Failed enabling the interrupt route")]
     EnableInterruptRoute(#[source] io::Error),
+    /// Failed disabling the interrupt route.
+    #[error("Failed disabling the interrupt route")]
+    DisableInterrupt(#[source] io::Error),
     /// Failed updating the interrupt route.
     #[error("Failed updating the interrupt route")]
     UpdateInterruptRoute(#[source] io::Error),
@@ -218,16 +221,15 @@ impl MsixConfig {
         self.enabled
     }
 
-    pub fn set_msg_ctl(&mut self, reg: u16) {
+    pub fn set_msg_ctl(&mut self, reg: u16) -> result::Result<(), Error> {
         let old_masked = self.masked;
         let old_enabled = self.enabled;
-
-        self.masked = ((reg >> FUNCTION_MASK_BIT) & 1u16) == 1u16;
-        self.enabled = ((reg >> MSIX_ENABLE_BIT) & 1u16) == 1u16;
+        let new_masked = ((reg >> FUNCTION_MASK_BIT) & 1u16) == 1u16;
+        let new_enabled = ((reg >> MSIX_ENABLE_BIT) & 1u16) == 1u16;
 
         // Update interrupt routing
-        if old_masked != self.masked || old_enabled != self.enabled {
-            if self.enabled && !self.masked {
+        if old_masked != new_masked || old_enabled != new_enabled {
+            if new_enabled && !new_masked {
                 debug!("MSI-X enabled for device 0x{:x}", self.devid);
                 for (idx, table_entry) in self.table_entries.iter().enumerate() {
                     let config = MsiIrqSourceConfig {
@@ -237,22 +239,25 @@ impl MsixConfig {
                         devid: self.devid,
                     };
 
-                    if let Err(e) = self.interrupt_source_group.update(
-                        idx as InterruptIndex,
-                        InterruptSourceConfig::MsiIrq(config),
-                        table_entry.masked(),
-                        true,
-                    ) {
-                        error!("Failed updating vector: {e:?}");
-                    }
+                    self.interrupt_source_group
+                        .update(
+                            idx as InterruptIndex,
+                            InterruptSourceConfig::MsiIrq(config),
+                            table_entry.masked(),
+                            true,
+                        )
+                        .map_err(Error::UpdateInterruptRoute)?;
                 }
             } else if old_enabled || !old_masked {
                 debug!("MSI-X disabled for device 0x{:x}", self.devid);
-                if let Err(e) = self.interrupt_source_group.disable() {
-                    error!("Failed disabling irq_fd: {e:?}");
-                }
+                self.interrupt_source_group
+                    .disable()
+                    .map_err(Error::DisableInterrupt)?;
             }
         }
+
+        self.masked = new_masked;
+        self.enabled = new_enabled;
 
         // If the Function Mask bit was set, and has just been cleared, it's
         // important to go through the entire PBA to check if there was any
@@ -265,6 +270,8 @@ impl MsixConfig {
                 }
             }
         }
+
+        Ok(())
     }
 
     pub fn read_table(&self, offset: u64, data: &mut [u8]) {
@@ -320,13 +327,13 @@ impl MsixConfig {
         }
     }
 
-    pub fn write_table(&mut self, offset: u64, data: &[u8]) {
+    pub fn write_table(&mut self, offset: u64, data: &[u8]) -> result::Result<(), Error> {
         if data.len() != 4 && data.len() != 8 {
             error!(
                 "invalid MSI-X table write size: {} (allowed: 4 or 8)",
                 data.len()
             );
-            return;
+            return Ok(());
         }
 
         let index: usize = (offset / MSIX_TABLE_ENTRIES_MODULO) as usize;
@@ -334,21 +341,22 @@ impl MsixConfig {
 
         if index >= self.table_entries.len() {
             debug!("Invalid MSI-X table entry index {index}");
-            return;
+            return Ok(());
         }
 
         // Store the value of the entry before modification
         let old_entry = self.table_entries[index].clone();
+        let mut new_entry = old_entry.clone();
 
         match data.len() {
             4 => {
                 let value = LittleEndian::read_u32(data);
                 match modulo_offset {
-                    0x0 => self.table_entries[index].msg_addr_lo = value,
-                    0x4 => self.table_entries[index].msg_addr_hi = value,
-                    0x8 => self.table_entries[index].msg_data = value,
+                    0x0 => new_entry.msg_addr_lo = value,
+                    0x4 => new_entry.msg_addr_hi = value,
+                    0x8 => new_entry.msg_data = value,
                     0xc => {
-                        self.table_entries[index].vector_ctl = value;
+                        new_entry.vector_ctl = value;
                     }
                     _ => error!("invalid offset"),
                 }
@@ -359,12 +367,12 @@ impl MsixConfig {
                 let value = LittleEndian::read_u64(data);
                 match modulo_offset {
                     0x0 => {
-                        self.table_entries[index].msg_addr_lo = (value & 0xffff_ffffu64) as u32;
-                        self.table_entries[index].msg_addr_hi = (value >> 32) as u32;
+                        new_entry.msg_addr_lo = (value & 0xffff_ffffu64) as u32;
+                        new_entry.msg_addr_hi = (value >> 32) as u32;
                     }
                     0x8 => {
-                        self.table_entries[index].msg_data = (value & 0xffff_ffffu64) as u32;
-                        self.table_entries[index].vector_ctl = (value >> 32) as u32;
+                        new_entry.msg_data = (value & 0xffff_ffffu64) as u32;
+                        new_entry.vector_ctl = (value >> 32) as u32;
                     }
                     _ => error!("invalid offset"),
                 }
@@ -374,34 +382,35 @@ impl MsixConfig {
             _ => error!("invalid data length"),
         }
 
-        let table_entry = &self.table_entries[index];
-
         // Optimisation to avoid excessive updates
-        if &old_entry == table_entry {
-            return;
+        if old_entry == new_entry {
+            return Ok(());
         }
 
         // Update interrupt routes
         // Optimisation: only update routes if the entry is not masked;
         // this is safe because if the entry is masked (starts masked as per spec)
         // in the table then it won't be triggered. (See: #4273)
-        if self.enabled && !self.masked && !table_entry.masked() {
+        if self.enabled && !self.masked && !new_entry.masked() {
             let config = MsiIrqSourceConfig {
-                high_addr: table_entry.msg_addr_hi,
-                low_addr: table_entry.msg_addr_lo,
-                data: table_entry.msg_data,
+                high_addr: new_entry.msg_addr_hi,
+                low_addr: new_entry.msg_addr_lo,
+                data: new_entry.msg_data,
                 devid: self.devid,
             };
 
-            if let Err(e) = self.interrupt_source_group.update(
-                index as InterruptIndex,
-                InterruptSourceConfig::MsiIrq(config),
-                table_entry.masked(),
-                true,
-            ) {
-                error!("Failed updating vector: {e:?}");
-            }
+            self.interrupt_source_group
+                .update(
+                    index as InterruptIndex,
+                    InterruptSourceConfig::MsiIrq(config),
+                    new_entry.masked(),
+                    true,
+                )
+                .map_err(Error::UpdateInterruptRoute)?;
         }
+
+        self.table_entries[index] = new_entry;
+        let table_entry = &self.table_entries[index];
 
         // After the MSI-X table entry has been updated, it is necessary to
         // check if the vector control masking bit has changed. In case the
@@ -420,6 +429,8 @@ impl MsixConfig {
         {
             self.inject_msix_and_clear_pba(index);
         }
+
+        Ok(())
     }
 
     pub fn read_pba(&mut self, offset: u64, data: &mut [u8]) {
@@ -518,6 +529,112 @@ impl Snapshottable for MsixConfig {
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
         Snapshot::new_from_state(&self.state())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use vmm_sys_util::eventfd::EventFd;
+
+    use super::*;
+
+    struct FailingInterruptSourceGroup {
+        fail_index: InterruptIndex,
+        failures: AtomicUsize,
+    }
+
+    impl FailingInterruptSourceGroup {
+        fn new(fail_index: InterruptIndex) -> Self {
+            Self {
+                fail_index,
+                failures: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl InterruptSourceGroup for FailingInterruptSourceGroup {
+        fn trigger(&self, _index: InterruptIndex) -> vm_device::interrupt::Result<()> {
+            Ok(())
+        }
+
+        fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
+            EventFd::new(libc::EFD_NONBLOCK).ok()
+        }
+
+        fn update(
+            &self,
+            index: InterruptIndex,
+            _config: InterruptSourceConfig,
+            masked: bool,
+            _set_gsi: bool,
+        ) -> vm_device::interrupt::Result<()> {
+            if index == self.fail_index && !masked {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+                return Err(io::Error::other(format!(
+                    "failed routing interrupt index {index}"
+                )));
+            }
+
+            Ok(())
+        }
+
+        fn set_gsi(&self) -> vm_device::interrupt::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn msix_table_update_error_keeps_high_vector_masked() {
+        let concrete_group = Arc::new(FailingInterruptSourceGroup::new(63));
+        let interrupt_source_group =
+            MaybeMutInterruptSourceGroup::Immutable(concrete_group.clone());
+        let mut msix_config = MsixConfig::new(64, interrupt_source_group, 0, None).unwrap();
+
+        msix_config.set_msg_ctl(MSIX_ENABLE_MASK).unwrap();
+
+        let high_vector_offset = 63 * MSIX_TABLE_ENTRIES_MODULO;
+        let msg_addr_lo = 0xfee0_0000u32;
+        msix_config
+            .write_table(high_vector_offset, &msg_addr_lo.to_le_bytes())
+            .unwrap();
+
+        let msg_data_and_unmasked_vector_ctl = 0x45u64;
+        let error = msix_config
+            .write_table(
+                high_vector_offset + 8,
+                &msg_data_and_unmasked_vector_ctl.to_le_bytes(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, Error::UpdateInterruptRoute(_)));
+        assert_eq!(concrete_group.failures.load(Ordering::Relaxed), 1);
+        assert!(
+            msix_config.table_entries[63].masked(),
+            "MSI-X vector state must not be unmasked when routing fails"
+        );
+    }
+
+    #[test]
+    fn msix_control_update_error_keeps_previous_state() {
+        let concrete_group = Arc::new(FailingInterruptSourceGroup::new(0));
+        let interrupt_source_group =
+            MaybeMutInterruptSourceGroup::Immutable(concrete_group.clone());
+        let mut msix_config = MsixConfig::new(1, interrupt_source_group, 0, None).unwrap();
+
+        let vector_ctl = 0u32;
+        msix_config
+            .write_table(12, &vector_ctl.to_le_bytes())
+            .unwrap();
+
+        let error = msix_config.set_msg_ctl(MSIX_ENABLE_MASK).unwrap_err();
+
+        assert!(matches!(error, Error::UpdateInterruptRoute(_)));
+        assert_eq!(concrete_group.failures.load(Ordering::Relaxed), 1);
+        assert!(!msix_config.enabled());
+        assert!(msix_config.masked());
     }
 }
 

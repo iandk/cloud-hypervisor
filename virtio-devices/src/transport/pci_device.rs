@@ -1254,10 +1254,14 @@ impl PciDevice for VirtioPciDevice {
                 error!("Unexpected write to notification BAR: offset = 0x{o:x}");
             }
             o if (MSIX_TABLE_BAR_OFFSET..MSIX_TABLE_BAR_OFFSET + MSIX_TABLE_SIZE).contains(&o) => {
-                self.msix_config
+                if let Err(e) = self
+                    .msix_config
                     .lock()
                     .unwrap()
-                    .write_table(o - MSIX_TABLE_BAR_OFFSET, data);
+                    .write_table(o - MSIX_TABLE_BAR_OFFSET, data)
+                {
+                    error!("Failed updating MSI-X table: {e}");
+                }
             }
             o if (MSIX_PBA_BAR_OFFSET..MSIX_PBA_BAR_OFFSET + MSIX_PBA_SIZE).contains(&o) => {
                 self.msix_config
@@ -1437,7 +1441,11 @@ mod unit_tests {
     fn trigger_with_valid_vector_fires() {
         let intr = make_msix_interrupt(2);
         intr.queues_vectors.lock().unwrap()[0] = 0;
-        intr.msix_config.lock().unwrap().set_msg_ctl(1u16 << 15);
+        intr.msix_config
+            .lock()
+            .unwrap()
+            .set_msg_ctl(1u16 << 15)
+            .unwrap();
         intr.trigger(VirtioInterruptType::Queue(0)).unwrap();
     }
 

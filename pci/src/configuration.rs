@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use byteorder::{ByteOrder, LittleEndian};
-use log::{info, warn};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_device::PciBarType;
@@ -912,16 +912,19 @@ impl PciConfiguration {
         if let Some(msix_cap_reg_idx) = self.msix_cap_reg_idx
             && let Some(msix_config) = &self.msix_config
         {
-            if msix_cap_reg_idx == reg_idx && offset == 2 && data.len() == 2 {
-                msix_config
-                    .lock()
-                    .unwrap()
-                    .set_msg_ctl(LittleEndian::read_u16(data));
+            let msg_ctl = if msix_cap_reg_idx == reg_idx && offset == 2 && data.len() == 2 {
+                Some(LittleEndian::read_u16(data))
             } else if msix_cap_reg_idx == reg_idx && offset == 0 && data.len() == 4 {
-                msix_config
-                    .lock()
-                    .unwrap()
-                    .set_msg_ctl((LittleEndian::read_u32(data) >> 16) as u16);
+                Some((LittleEndian::read_u32(data) >> 16) as u16)
+            } else {
+                None
+            };
+
+            if let Some(msg_ctl) = msg_ctl
+                && let Err(e) = msix_config.lock().unwrap().set_msg_ctl(msg_ctl)
+            {
+                error!("Failed updating MSI-X control: {e}");
+                return Vec::new();
             }
         }
 
