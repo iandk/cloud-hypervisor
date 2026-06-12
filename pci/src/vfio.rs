@@ -45,6 +45,14 @@ use crate::{
 };
 
 pub(crate) const VFIO_COMMON_ID: &str = "vfio_common";
+const OPENRM_EXPOSE_FILTERED_EXT_CAPS_ENV: &str = "CH_VFIO_OPENRM_EXPOSE_FILTERED_EXT_CAPS";
+
+fn openrm_expose_filtered_ext_caps() -> bool {
+    std::env::var(OPENRM_EXPOSE_FILTERED_EXT_CAPS_ENV).is_ok_and(|value| {
+        let value = value.to_ascii_lowercase();
+        !(value.is_empty() || value == "0" || value == "false" || value == "no" || value == "off")
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum VfioPciError {
@@ -502,6 +510,7 @@ pub(crate) struct VfioCommon {
     pub(crate) patches: HashMap<usize, ConfigPatch>,
     x_nv_gpudirect_clique: Option<u8>,
     x_exclude_mmap_bars: Vec<u8>,
+    x_openrm_expose_filtered_ext_caps: bool,
 }
 
 #[derive(Default)]
@@ -555,6 +564,7 @@ impl VfioCommon {
             patches: HashMap::new(),
             x_nv_gpudirect_clique: config.x_nv_gpudirect_clique,
             x_exclude_mmap_bars: config.x_exclude_mmap_bars,
+            x_openrm_expose_filtered_ext_caps: openrm_expose_filtered_ext_caps(),
         };
 
         let state: Option<VfioCommonState> = snapshot
@@ -1042,6 +1052,18 @@ impl VfioCommon {
     }
 
     fn parse_extended_capabilities(&mut self) {
+        if self.x_openrm_expose_filtered_ext_caps {
+            info!(
+                "{OPENRM_EXPOSE_FILTERED_EXT_CAPS_ENV}=1: exposing VFIO extended \
+                 capabilities normally masked by cloud-hypervisor"
+            );
+            // Experimental OpenRM cuInit investigation toggle. Hypothesis:
+            // userspace rejects CUDA init because CH hides a VFIO endpoint
+            // extended capability that QEMU forwards. This is deliberately off
+            // by default and should not be treated as a production fix.
+            return;
+        }
+
         let mut current_offset = PCI_CONFIG_EXTENDED_CAPABILITY_OFFSET;
 
         loop {
