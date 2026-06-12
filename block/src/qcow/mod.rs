@@ -60,6 +60,11 @@ use crate::qcow::refcount::RefCount;
 use crate::qcow::vec_cache::{CacheMap, Cacheable, VecCache};
 use crate::qcow_common::decompress_cluster;
 
+// QEMU documents an 8 MiB implementation limit for the top-level refcount
+// table. Keep the same absolute cap: refcount_table_clusters is the allocated
+// table capacity and can validly exceed the minimum needed for image.size.
+const QEMU_MAX_REFCOUNT_TABLE_BYTES: u64 = 8 * 1024 * 1024;
+
 #[sorted]
 #[derive(Debug, Error)]
 pub enum Error {
@@ -166,6 +171,35 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+fn validate_refcount_table_capacity(
+    header: &QcowHeader,
+    cluster_size: u64,
+    required_refcount_blocks: u64,
+) -> BlockResult<u64> {
+    let refcount_table_bytes = u64::from(header.refcount_table_clusters)
+        .checked_mul(cluster_size)
+        .ok_or_else(|| {
+            BlockError::new(BlockErrorKind::CorruptImage, Error::RefcountTableTooLarge)
+        })?;
+
+    if refcount_table_bytes > QEMU_MAX_REFCOUNT_TABLE_BYTES {
+        return Err(BlockError::new(
+            BlockErrorKind::CorruptImage,
+            Error::RefcountTableTooLarge,
+        ));
+    }
+
+    let refcount_table_entries = refcount_table_bytes / size_of::<u64>() as u64;
+    if refcount_table_entries < required_refcount_blocks {
+        return Err(BlockError::new(
+            BlockErrorKind::InvalidFormat,
+            Error::NotEnoughSpaceForRefcounts,
+        ));
+    }
+
+    Ok(refcount_table_entries)
+}
 
 /// Concrete backing file variants.
 pub(crate) enum BackingKind {
@@ -473,6 +507,19 @@ pub(crate) fn parse_qcow(
         ));
     }
 
+    let entries_per_cluster = cluster_size / size_of::<u64>() as u64;
+    let num_clusters = div_round_up_u64(header.size, cluster_size);
+    let num_l2_clusters = div_round_up_u64(num_clusters, entries_per_cluster);
+    let l1_clusters = div_round_up_u64(num_l2_clusters, entries_per_cluster);
+    let header_clusters = div_round_up_u64(size_of::<QcowHeader>() as u64, cluster_size);
+    let required_refcount_blocks = max_refcount_clusters(
+        header.refcount_order,
+        cluster_size as u32,
+        (num_clusters + l1_clusters + num_l2_clusters + header_clusters) as u32,
+    );
+    let refcount_table_entries =
+        validate_refcount_table_capacity(&header, cluster_size, required_refcount_blocks)?;
+
     // The first cluster should always have a non-zero refcount, so if it is 0,
     // this is an old file with broken refcounts, which requires a rebuild.
     let mut refcount_rebuild_required = true;
@@ -523,11 +570,6 @@ pub(crate) fn parse_qcow(
         QcowFile::rebuild_refcounts(&mut raw_file, header.clone())?;
     }
 
-    let entries_per_cluster = cluster_size / size_of::<u64>() as u64;
-    let num_clusters = div_round_up_u64(header.size, cluster_size);
-    let num_l2_clusters = div_round_up_u64(num_clusters, entries_per_cluster);
-    let l1_clusters = div_round_up_u64(num_l2_clusters, entries_per_cluster);
-    let header_clusters = div_round_up_u64(size_of::<QcowHeader>() as u64, cluster_size);
     if num_l2_clusters > MAX_RAM_POINTER_TABLE_SIZE {
         return Err(BlockError::new(
             BlockErrorKind::CorruptImage,
@@ -544,30 +586,17 @@ pub(crate) fn parse_qcow(
             .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::ReadingHeader(e)))?,
     );
 
-    let num_clusters = div_round_up_u64(header.size, cluster_size);
-    let refcount_clusters = max_refcount_clusters(
-        header.refcount_order,
-        cluster_size as u32,
-        (num_clusters + l1_clusters + num_l2_clusters + header_clusters) as u32,
-    );
-    // Check that the given header doesn't have a suspiciously sized refcount table.
-    if u64::from(header.refcount_table_clusters) > 2 * refcount_clusters {
-        return Err(BlockError::new(
-            BlockErrorKind::CorruptImage,
-            Error::RefcountTableTooLarge,
-        ));
-    }
-    if l1_clusters + refcount_clusters > MAX_RAM_POINTER_TABLE_SIZE {
+    if l1_clusters + required_refcount_blocks > MAX_RAM_POINTER_TABLE_SIZE {
         return Err(BlockError::new(
             BlockErrorKind::InvalidFormat,
-            Error::TooManyRefcounts(refcount_clusters),
+            Error::TooManyRefcounts(required_refcount_blocks),
         ));
     }
     let refcount_block_entries = cluster_size * 8 / refcount_bits;
     let mut refcounts = RefCount::new(
         &mut raw_file,
         header.refcount_table_offset,
-        refcount_clusters,
+        refcount_table_entries,
         refcount_block_entries,
         cluster_size,
         refcount_bits,
@@ -2486,6 +2515,14 @@ mod unit_tests {
         disk_file
     }
 
+    fn file_from_header_with_len(header: &QcowHeader, len: u64) -> RawFile {
+        let mut disk_file: RawFile = RawFile::new(TempFile::new().unwrap().into_file(), false);
+        header.write_to(&mut disk_file).unwrap();
+        disk_file.set_len(len).unwrap();
+        disk_file.rewind().unwrap();
+        disk_file
+    }
+
     fn with_basic_file<F>(header: &[u8], mut testfn: F)
     where
         F: FnMut(RawFile),
@@ -2612,6 +2649,37 @@ mod unit_tests {
             .expect("Failed to write header to temporary file.");
         disk_file.rewind().unwrap();
         QcowFile::from(disk_file).expect("Failed to create Qcow from default Header");
+    }
+
+    #[test]
+    fn overallocated_refcount_table_is_accepted() {
+        let mut header = QcowHeader::create_for_size_and_path(3, 0x10_0000, None).unwrap();
+        let cluster_size = 1u64 << header.cluster_bits;
+        header.refcount_table_clusters = 8;
+
+        let disk_file = file_from_header_with_len(
+            &header,
+            header.refcount_table_offset + u64::from(header.refcount_table_clusters) * cluster_size,
+        );
+
+        QcowFile::from(disk_file).expect("overallocated refcount table should open");
+    }
+
+    #[test]
+    fn oversized_refcount_table_is_rejected() {
+        let mut header = QcowHeader::create_for_size_and_path(3, 0x10_0000, None).unwrap();
+        let cluster_size = 1u64 << header.cluster_bits;
+        header.refcount_table_clusters = (QEMU_MAX_REFCOUNT_TABLE_BYTES / cluster_size + 1) as u32;
+
+        let disk_file =
+            file_from_header_with_len(&header, header.refcount_table_offset + cluster_size);
+        let err = QcowFile::from(disk_file).expect_err("oversized refcount table should fail");
+
+        assert_eq!(err.kind(), crate::error::BlockErrorKind::CorruptImage);
+        assert!(
+            err.downcast_ref::<Error>()
+                .is_some_and(|e| matches!(e, Error::RefcountTableTooLarge))
+        );
     }
 
     #[test]
