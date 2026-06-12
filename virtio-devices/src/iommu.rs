@@ -5,12 +5,13 @@
 use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::{io, result};
 
 use anyhow::anyhow;
 use event_monitor::event;
+use libc::{EFAULT, EINVAL, ENOMEM, ENOSPC};
 use log::{debug, error, info};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,12 @@ const MAX_MAPPINGS_PER_DOMAIN: usize = 1 << 20;
 // Bound the per-device domain count so a guest cannot grow the
 // domain map indefinitely with ATTACH-only requests.
 const MAX_DOMAINS: usize = 1 << 16;
+
+// Keep repetitive VFIO/container failures visible without flooding logs when
+// the guest retries many 4 KiB mappings after a host-side resource limit trips.
+const IOMMU_DMA_ERROR_LOG_INTERVAL: u64 = 1024;
+static IOMMU_DMA_MAP_ERROR_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static IOMMU_DMA_UNMAP_ERROR_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
@@ -335,6 +342,35 @@ enum Error {
     ExternalUnmapping(#[source] io::Error),
     #[error("Failed adding used index")]
     QueueAddUsed(#[source] virtio_queue::Error),
+}
+
+fn dma_error_status(error: &io::Error) -> u8 {
+    match error.raw_os_error() {
+        Some(errno) if errno == ENOSPC || errno == ENOMEM => VIRTIO_IOMMU_S_NOMEM,
+        Some(errno) if errno == EINVAL => VIRTIO_IOMMU_S_INVAL,
+        Some(errno) if errno == EFAULT => VIRTIO_IOMMU_S_FAULT,
+        _ => VIRTIO_IOMMU_S_DEVERR,
+    }
+}
+
+fn log_external_dma_error(
+    op: &str,
+    counter: &AtomicU64,
+    domain_id: u32,
+    endpoint: u32,
+    iova: u64,
+    size: u64,
+    error: &io::Error,
+) {
+    let error_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if error_count == 1 || error_count.is_multiple_of(IOMMU_DMA_ERROR_LOG_INTERVAL) {
+        error!(
+            "virtio-iommu {op} failed: domain {domain_id} endpoint {endpoint} \
+             iova 0x{iova:x} size 0x{size:x} errno {} error {error}; \
+             failure count {error_count}",
+            error.raw_os_error().unwrap_or(0)
+        );
+    }
 }
 
 struct Request {}
@@ -609,8 +645,17 @@ impl Request {
                     for endpoint in endpoints {
                         if let Some(ext_map) = ext_mapping.get(&endpoint) {
                             if let Err(e) = ext_map.map(req.virt_start, req.phys_start, size) {
+                                status = dma_error_status(&e);
+                                log_external_dma_error(
+                                    "MAP",
+                                    &IOMMU_DMA_MAP_ERROR_LOG_COUNT,
+                                    domain_id,
+                                    endpoint,
+                                    req.virt_start,
+                                    size,
+                                    &e,
+                                );
                                 rollback(&mapped);
-                                status = VIRTIO_IOMMU_S_DEVERR;
                                 return Err(Error::ExternalMapping(e));
                             }
                             mapped.push(endpoint);
@@ -713,10 +758,20 @@ impl Request {
 
                     // Trigger external unmapping if necessary.
                     for endpoint in endpoints {
-                        if let Some(ext_map) = ext_mapping.get(&endpoint) {
-                            ext_map
-                                .unmap(virt_start, size)
-                                .map_err(Error::ExternalUnmapping)?;
+                        if let Some(ext_map) = ext_mapping.get(&endpoint)
+                            && let Err(e) = ext_map.unmap(virt_start, size)
+                        {
+                            status = dma_error_status(&e);
+                            log_external_dma_error(
+                                "UNMAP",
+                                &IOMMU_DMA_UNMAP_ERROR_LOG_COUNT,
+                                domain_id,
+                                endpoint,
+                                virt_start,
+                                size,
+                                &e,
+                            );
+                            return Err(Error::ExternalUnmapping(e));
                         }
                     }
 
@@ -798,8 +853,13 @@ impl Request {
             .write_slice(reply.as_slice(), status_desc.addr())
             .map_err(Error::GuestMemory)?;
 
-        // Return the error if the result was not Ok().
-        result?;
+        if let Err(e) = result {
+            if status == VIRTIO_IOMMU_S_OK {
+                return Err(e);
+            }
+
+            debug!("virtio-iommu request completed with status {status}: {e:?}");
+        }
 
         Ok(reply_len)
     }
@@ -1352,3 +1412,211 @@ impl Snapshottable for Iommu {
 }
 impl Transportable for Iommu {}
 impl Migratable for Iommu {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+    use vm_device::dma_mapping::ExternalDmaMapping;
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryAtomic};
+    use vm_virtio::queue::testing::VirtQueue as GuestQueue;
+    use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+
+    use super::*;
+
+    const MEM_SIZE: usize = 0x50_0000;
+    const QUEUE_START: u64 = 0x10_0000;
+    const MAP_REQ_ADDR: u64 = 0x40_0000;
+    const MAP_STATUS_ADDR: u64 = 0x41_0000;
+    const PROBE_REQ_ADDR: u64 = 0x42_0000;
+    const PROBE_STATUS_ADDR: u64 = 0x43_0000;
+    const DOMAIN_ID: u32 = 1;
+    const ENDPOINT_ID: u32 = 0x10;
+
+    struct NoopVirtioInterrupt;
+
+    impl VirtioInterrupt for NoopVirtioInterrupt {
+        fn trigger(&self, _int_type: VirtioInterruptType) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_notifier(
+            &self,
+            _interrupt: u32,
+            _eventfd: Option<EventFd>,
+            _vm: &dyn hypervisor::Vm,
+        ) -> io::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    struct FailingDmaMapping {
+        map_calls: AtomicUsize,
+    }
+
+    impl FailingDmaMapping {
+        fn new() -> Self {
+            Self {
+                map_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ExternalDmaMapping for FailingDmaMapping {
+        fn map(&self, _iova: u64, _gpa: u64, _size: u64) -> io::Result<()> {
+            self.map_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(io::Error::from_raw_os_error(ENOSPC))
+        }
+
+        fn unmap(&self, _iova: u64, _size: u64) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_map_request(mem: &GuestMemoryMmap, addr: GuestAddress) {
+        mem.write_obj(
+            VirtioIommuReqHead {
+                type_: VIRTIO_IOMMU_T_MAP,
+                ..Default::default()
+            },
+            addr,
+        )
+        .unwrap();
+        mem.write_obj(
+            VirtioIommuReqMap {
+                domain: DOMAIN_ID,
+                virt_start: 0x2000,
+                virt_end: 0x2fff,
+                phys_start: 0x3000,
+                flags: VIRTIO_IOMMU_MAP_F_READ | VIRTIO_IOMMU_MAP_F_WRITE,
+            },
+            addr.checked_add(size_of::<VirtioIommuReqHead>() as u64)
+                .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_probe_request(mem: &GuestMemoryMmap, addr: GuestAddress) {
+        mem.write_obj(
+            VirtioIommuReqHead {
+                type_: VIRTIO_IOMMU_T_PROBE,
+                ..Default::default()
+            },
+            addr,
+        )
+        .unwrap();
+        mem.write_obj(
+            VirtioIommuReqProbe {
+                endpoint: ENDPOINT_ID,
+                ..Default::default()
+            },
+            addr.checked_add(size_of::<VirtioIommuReqHead>() as u64)
+                .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn new_mapping() -> Arc<IommuMapping> {
+        Arc::new(IommuMapping {
+            endpoints: Arc::new(RwLock::new(BTreeMap::from([(ENDPOINT_ID, DOMAIN_ID)]))),
+            domains: Arc::new(RwLock::new(BTreeMap::from([(
+                DOMAIN_ID,
+                Domain {
+                    mappings: BTreeMap::new(),
+                    bypass: false,
+                },
+            )]))),
+            bypass: AtomicBool::new(true),
+        })
+    }
+
+    #[test]
+    fn map_enospc_returns_status_and_processes_next_request() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap();
+        let guest_queue = GuestQueue::new(GuestAddress(QUEUE_START), &mem, 8);
+        let request_queue = guest_queue.create_queue();
+
+        write_map_request(&mem, GuestAddress(MAP_REQ_ADDR));
+        write_probe_request(&mem, GuestAddress(PROBE_REQ_ADDR));
+
+        let map_req_len = (size_of::<VirtioIommuReqHead>() + size_of::<VirtioIommuReqMap>()) as u32;
+        let probe_req_len =
+            (size_of::<VirtioIommuReqHead>() + size_of::<VirtioIommuReqProbe>()) as u32;
+        let tail_len = size_of::<VirtioIommuReqTail>() as u32;
+        let probe_reply_len = PROBE_PROP_SIZE + tail_len;
+
+        guest_queue.dtable[0].set(
+            MAP_REQ_ADDR,
+            map_req_len,
+            VRING_DESC_F_NEXT.try_into().unwrap(),
+            1,
+        );
+        guest_queue.dtable[1].set(
+            MAP_STATUS_ADDR,
+            tail_len,
+            VRING_DESC_F_WRITE.try_into().unwrap(),
+            0,
+        );
+        guest_queue.dtable[2].set(
+            PROBE_REQ_ADDR,
+            probe_req_len,
+            VRING_DESC_F_NEXT.try_into().unwrap(),
+            3,
+        );
+        guest_queue.dtable[3].set(
+            PROBE_STATUS_ADDR,
+            probe_reply_len,
+            VRING_DESC_F_WRITE.try_into().unwrap(),
+            0,
+        );
+        guest_queue.avail.ring[0].set(0);
+        guest_queue.avail.ring[1].set(2);
+        guest_queue.avail.idx.set(2);
+
+        let mapping = new_mapping();
+        let failing_mapping = Arc::new(FailingDmaMapping::new());
+        let mut ext_mapping: BTreeMap<u32, Arc<dyn ExternalDmaMapping>> = BTreeMap::new();
+        ext_mapping.insert(ENDPOINT_ID, failing_mapping.clone());
+
+        let mut handler = IommuEpollHandler {
+            mem: GuestMemoryAtomic::new(mem.clone()),
+            request_queue,
+            _event_queue: GuestQueue::new(GuestAddress(0x18_0000), &mem, 8).create_queue(),
+            interrupt_cb: Arc::new(NoopVirtioInterrupt),
+            request_queue_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            _event_queue_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            kill_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            pause_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
+            mapping: mapping.clone(),
+            ext_mapping: Arc::new(Mutex::new(ext_mapping)),
+            msi_iova_space: (0xfee0_0000, 0xfeef_ffff),
+            input_range: None,
+        };
+
+        assert!(handler.request_queue().unwrap());
+        assert_eq!(guest_queue.used.idx.get(), 2);
+        assert_eq!(failing_mapping.map_calls.load(AtomicOrdering::Relaxed), 1);
+
+        let map_tail: VirtioIommuReqTail = mem.read_obj(GuestAddress(MAP_STATUS_ADDR)).unwrap();
+        assert_eq!(map_tail.status, VIRTIO_IOMMU_S_NOMEM);
+
+        let probe_tail: VirtioIommuReqTail = mem
+            .read_obj(GuestAddress(PROBE_STATUS_ADDR + u64::from(PROBE_PROP_SIZE)))
+            .unwrap();
+        assert_eq!(probe_tail.status, VIRTIO_IOMMU_S_OK);
+
+        assert!(
+            mapping
+                .domains
+                .read()
+                .unwrap()
+                .get(&DOMAIN_ID)
+                .unwrap()
+                .mappings
+                .is_empty()
+        );
+    }
+}
