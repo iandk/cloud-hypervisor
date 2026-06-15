@@ -168,8 +168,10 @@ impl PciBus {
     /// because the `pci` crate does not depend on `arch`. Returns `None` when
     /// all secondary buses in the segment are exhausted.
     pub fn allocate_secondary_bus(&mut self) -> Option<u8> {
-        // 1..8: buses 1 through 7 are available for root-port secondary buses.
-        (1..8).find(|bus| !self.secondary_buses.contains_key(bus))
+        // buses 1..16 are available for root-port secondary buses, matching
+        // arch::layout::PCI_BUSES_PER_SEGMENT (16). 16 lets one segment hold
+        // 8 GPUs each behind a root port (the vIOMMU-off SEG0 config).
+        (1..16).find(|bus| !self.secondary_buses.contains_key(bus))
     }
 
     /// Resolve a config-cycle (bus, device, function) target to the owning

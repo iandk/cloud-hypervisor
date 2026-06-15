@@ -100,8 +100,10 @@ pub const PCI_MMCONFIG_SIZE: u64 = 256 << 20;
 // bytes x 256 dev/func = 1 MiB) so that passed-through GPUs can sit on a
 // secondary bus behind a PCIe root port (OpenRM/cuInit requires a root port
 // above the GPU; see pci::root_port + the multi-bus routing in pci::bus).
-// 8 segments-worth still fits comfortably in PCI_MMCONFIG_SIZE (256 MiB).
-pub const PCI_BUSES_PER_SEGMENT: u64 = 8;
+// 16 buses/segment lets a single segment carry 8 GPUs each behind their own
+// root port (needed for the vIOMMU-off SEG0 config). Even 9 segments x 16 MiB
+// fit comfortably in PCI_MMCONFIG_SIZE (256 MiB).
+pub const PCI_BUSES_PER_SEGMENT: u64 = 16;
 pub const PCI_MMIO_CONFIG_SIZE_PER_SEGMENT: u64 = 4096 * 256 * PCI_BUSES_PER_SEGMENT;
 
 // TSS is 3 pages after the PCI MMCONFIG space
