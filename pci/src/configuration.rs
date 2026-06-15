@@ -596,7 +596,16 @@ impl PciConfiguration {
                 }
                 PciHeaderType::Bridge => {
                     registers[3] = 0x0001_0000; // Header type 1 (bridge)
-                    writable_bits[9] = 0xfff0_fff0; // Memory base and limit
+                    writable_bits[8] = 0xfff0_fff0; // Non-prefetchable memory base/limit
+                    writable_bits[9] = 0xfff0_fff0; // Prefetchable memory base/limit (addr bits)
+                    // Advertise 64-bit decode for the prefetchable window (low
+                    // nibble of base and limit = 0x1) so the guest can place a
+                    // large 64-bit prefetchable BAR (e.g. an H100's 64 GiB BAR)
+                    // of a device behind this bridge, using the upper-32-bit
+                    // base/limit registers below.
+                    registers[9] = 0x0001_0001;
+                    writable_bits[10] = 0xffff_ffff; // Prefetchable base upper 32 bits
+                    writable_bits[11] = 0xffff_ffff; // Prefetchable limit upper 32 bits
                     writable_bits[15] = 0xffff_00ff; // Bridge control (r/w), interrupt line (r/w)
                 }
             }
@@ -1010,11 +1019,14 @@ impl PciConfiguration {
                 );
                 let old_base = u64::from(self.bars[bar_idx].addr & mask);
                 let new_base = u64::from(value & mask);
-                let len = u64::from(
-                    decode_32_bits_bar_size(self.bars[bar_idx].size)
-                        .ok_or(Error::Decode32BarSize)
-                        .unwrap(),
-                );
+                // If the size can't be decoded there is no real BAR here (e.g. a
+                // bridge register that overlaps the type-0 BAR range), so this is
+                // not a BAR reprogramming. Returning None avoids a guest-
+                // triggerable VMM panic (previously `.unwrap()`).
+                let Some(len) = decode_32_bits_bar_size(self.bars[bar_idx].size) else {
+                    return None;
+                };
+                let len = u64::from(len);
                 let region_type = bar_type;
 
                 self.bars[bar_idx].addr = value;
@@ -1038,10 +1050,15 @@ impl PciConfiguration {
                     | u64::from(self.bars[bar_idx - 1].addr & self.writable_bits[reg_idx - 1]);
                 let new_base = (u64::from(value & mask) << 32)
                     | u64::from(self.registers[reg_idx - 1] & self.writable_bits[reg_idx - 1]);
-                let len =
+                // No decodeable size => not a real 64-bit BAR (e.g. a type-1
+                // bridge memory-window register that overlaps the type-0 BAR
+                // range). Skip rather than panic (was a guest-triggerable
+                // `.unwrap()` crash).
+                let Some(len) =
                     decode_64_bits_bar_size(self.bars[bar_idx].size, self.bars[bar_idx - 1].size)
-                        .ok_or(Error::Decode64BarSize)
-                        .unwrap();
+                else {
+                    return None;
+                };
                 let region_type = PciBarRegionType::Memory64BitRegion;
 
                 self.bars[bar_idx].addr = value;

@@ -27,6 +27,15 @@ use crate::device::{BarReprogrammingParams, PciDevice};
 // [7:0] primary, [15:8] secondary, [23:16] subordinate, [31:24] sec latency.
 const BUS_NUMBER_REG: usize = 6;
 
+// Type-1 bridge BAR registers (config offsets 0x10 and 0x14). A PCIe root port
+// has no BARs, so these read as 0 and ignore writes. Without intercepting them,
+// the guest's BAR-sizing writes (0xffffffff probes) reach PciConfiguration's
+// detect_bar_reprogramming, which enters its 64-bit-BAR branch for an
+// unconfigured BAR and panics on `decode_64_bits_bar_size(...).unwrap()`
+// (size is 0). Intercepting here keeps those writes away from that path.
+const BAR0_REG: usize = 4;
+const BAR1_REG: usize = 5;
+
 // Present as a QEMU-compatible PCIe Root Port so guest enumeration and OpenRM
 // recognize a well-known root-port identity.
 const ROOT_PORT_VENDOR_ID: u16 = 0x1b36; // Red Hat, Inc.
@@ -144,7 +153,9 @@ impl PciDevice for PciRootPort {
         data: &[u8],
     ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
         // Bus numbers are fixed in this mode; ignore guest attempts to renumber.
-        if reg_idx == BUS_NUMBER_REG {
+        // BAR registers: a root port has no BARs, so ignore the guest's sizing
+        // writes (they would otherwise trip a panic in detect_bar_reprogramming).
+        if reg_idx == BUS_NUMBER_REG || reg_idx == BAR0_REG || reg_idx == BAR1_REG {
             return (Vec::new(), None);
         }
         (
@@ -156,6 +167,10 @@ impl PciDevice for PciRootPort {
     fn read_config_register(&mut self, reg_idx: usize) -> u32 {
         if reg_idx == BUS_NUMBER_REG {
             return self.bus_number_reg;
+        }
+        // Root port has no BARs: report empty BAR registers.
+        if reg_idx == BAR0_REG || reg_idx == BAR1_REG {
+            return 0;
         }
         self.config.read_config_register(reg_idx)
     }
