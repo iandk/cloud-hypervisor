@@ -122,9 +122,15 @@ enum DeviceIdState {
 }
 
 pub struct PciBus {
-    /// Devices attached to this bus.
+    /// Devices attached to bus 0 of this segment, keyed by device slot.
     /// Device 0 is host bridge.
     devices: HashMap<u8, Arc<Mutex<dyn PciDevice>>>,
+    /// Devices living on a secondary bus behind a PCIe root port, keyed by the
+    /// root port's secondary bus number. Each secondary bus carries exactly one
+    /// single-function endpoint (a passed-through GPU) at slot 0. This is how a
+    /// VFIO GPU is presented behind a root port instead of on the flat root bus,
+    /// which OpenRM requires for cuInit to succeed. See `root_port.rs`.
+    secondary_buses: HashMap<u8, Arc<Mutex<dyn PciDevice>>>,
     device_reloc: Arc<dyn DeviceRelocation>,
     device_ids: [DeviceIdState; NUM_DEVICE_IDS as usize],
 }
@@ -139,9 +145,46 @@ impl PciBus {
 
         PciBus {
             devices,
+            secondary_buses: HashMap::new(),
             device_reloc,
             device_ids,
         }
+    }
+
+    /// Place a single-function endpoint on a secondary bus behind a root port.
+    /// `secondary_bus` must match the owning root port's secondary bus number.
+    pub fn add_secondary_bus_device(
+        &mut self,
+        secondary_bus: u8,
+        device: Arc<Mutex<dyn PciDevice>>,
+    ) {
+        self.secondary_buses.insert(secondary_bus, device);
+    }
+
+    /// Resolve a config-cycle (bus, device, function) target to the owning
+    /// `PciDevice`. Bus 0 selects by slot; a non-zero bus selects the single
+    /// endpoint on that secondary bus (slot 0 only). Returns None for absent
+    /// targets so the caller returns all-ones (non-existent device).
+    pub fn config_device(
+        &self,
+        bus: u8,
+        device: u8,
+        function: u8,
+    ) -> Option<Arc<Mutex<dyn PciDevice>>> {
+        if function != 0 {
+            return None;
+        }
+        if bus == 0 {
+            self.devices.get(&device).cloned()
+        } else if device == 0 {
+            self.secondary_buses.get(&bus).cloned()
+        } else {
+            None
+        }
+    }
+
+    fn device_reloc(&self) -> Arc<dyn DeviceRelocation> {
+        self.device_reloc.clone()
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -283,25 +326,14 @@ impl PciConfigIo {
         let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
-        // Only support one bus.
-        if bus != 0 {
-            return 0xffff_ffff;
-        }
-
-        // Don't support multi-function devices.
-        if function > 0 {
-            return 0xffff_ffff;
-        }
-
-        self.pci_bus
-            .as_ref()
+        let dev = self
+            .pci_bus
             .lock()
             .unwrap()
-            .devices
-            .get(&(device as u8))
-            .map_or(0xffff_ffff, |d| {
-                d.lock().unwrap().read_config_register(register)
-            })
+            .config_device(bus as u8, device as u8, function as u8);
+        dev.map_or(0xffff_ffff, |d| {
+            d.lock().unwrap().read_config_register(register)
+        })
     }
 
     pub fn config_space_write(&mut self, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
@@ -314,16 +346,17 @@ impl PciConfigIo {
             return None;
         }
 
-        let (bus, device, _function, register) =
+        let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
-        // Only support one bus.
-        if bus != 0 {
-            return None;
-        }
-
-        let pci_bus = self.pci_bus.as_ref().lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(&(device as u8)) {
+        let (dev, device_reloc) = {
+            let pci_bus = self.pci_bus.as_ref().lock().unwrap();
+            (
+                pci_bus.config_device(bus as u8, device as u8, function as u8),
+                pci_bus.device_reloc(),
+            )
+        };
+        if let Some(d) = dev {
             let mut device = d.lock().unwrap();
 
             // Update the register value
@@ -331,7 +364,7 @@ impl PciConfigIo {
 
             // Move the device's BAR if needed
             for params in &bar_reprogram {
-                if let Err(e) = pci_bus.device_reloc.move_bar(
+                if let Err(e) = device_reloc.move_bar(
                     params.old_base,
                     params.new_base,
                     params.len,
@@ -423,21 +456,16 @@ impl PciConfigMmio {
     }
 
     fn config_space_read(&self, config_address: u32) -> u32 {
-        let (bus, device, _function, register) = parse_mmio_config_address(config_address);
+        let (bus, device, function, register) = parse_mmio_config_address(config_address);
 
-        // Only support one bus.
-        if bus != 0 {
-            return 0xffff_ffff;
-        }
-
-        self.pci_bus
+        let dev = self
+            .pci_bus
             .lock()
             .unwrap()
-            .devices
-            .get(&(device as u8))
-            .map_or(0xffff_ffff, |d| {
-                d.lock().unwrap().read_config_register(register)
-            })
+            .config_device(bus as u8, device as u8, function as u8);
+        dev.map_or(0xffff_ffff, |d| {
+            d.lock().unwrap().read_config_register(register)
+        })
     }
 
     fn config_space_write(&mut self, config_address: u32, offset: u64, data: &[u8]) {
@@ -445,15 +473,16 @@ impl PciConfigMmio {
             return;
         }
 
-        let (bus, device, _function, register) = parse_mmio_config_address(config_address);
+        let (bus, device, function, register) = parse_mmio_config_address(config_address);
 
-        // Only support one bus.
-        if bus != 0 {
-            return;
-        }
-
-        let pci_bus = self.pci_bus.lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(&(device as u8)) {
+        let (dev, device_reloc) = {
+            let pci_bus = self.pci_bus.lock().unwrap();
+            (
+                pci_bus.config_device(bus as u8, device as u8, function as u8),
+                pci_bus.device_reloc(),
+            )
+        };
+        if let Some(d) = dev {
             let mut device = d.lock().unwrap();
 
             // Update the register value
@@ -461,7 +490,7 @@ impl PciConfigMmio {
 
             // Move the device's BAR if needed
             for params in &bar_reprogram {
-                if let Err(e) = pci_bus.device_reloc.move_bar(
+                if let Err(e) = device_reloc.move_bar(
                     params.old_base,
                     params.new_base,
                     params.len,

@@ -341,12 +341,14 @@ fn create_mcfg_table(pci_segments: &[PciSegment]) -> Sdt {
     mcfg.append(0u64);
 
     for segment in pci_segments {
-        // 32-bit PCI enhanced configuration mechanism
+        // 32-bit PCI enhanced configuration mechanism. The bus range must cover
+        // the secondary buses created for PCIe root ports (GPUs sit behind a
+        // root port on a non-zero bus), matching PCI_BUSES_PER_SEGMENT.
         mcfg.append(PciRangeEntry {
             base_address: segment.mmio_config_address,
             segment: segment.id,
             start: 0,
-            end: 0,
+            end: (arch::layout::PCI_BUSES_PER_SEGMENT - 1) as u8,
             ..Default::default()
         });
     }
