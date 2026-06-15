@@ -74,8 +74,8 @@ use libc::{
 };
 use log::{debug, error, info, warn};
 use pci::{
-    DeviceRelocation, MmioRegion, PciBarRegionType, PciBdf, PciDevice, VfioDmaMapping,
-    VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
+    DeviceRelocation, MmioRegion, PciBarRegionType, PciBdf, PciDevice, PciRootPort,
+    VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
 };
 use rate_limiter::group::RateLimiterGroup;
 use seccompiler::SeccompAction;
@@ -4028,14 +4028,58 @@ impl DeviceManager {
             )
             .map_err(DeviceManagerError::AllocateBars)?;
 
+        // Decide whether this device should be placed behind a PCIe root port
+        // on a secondary bus instead of on the flat root bus (bus 0). NVIDIA's
+        // open kernel module requires a passed-through GPU to sit behind a root
+        // port for cuInit to succeed; on a flat root bus it returns rc=3
+        // (CUDA_ERROR_NOT_INITIALIZED). Gated behind the CH_ROOT_PORT_PASSTHROUGH
+        // env var so default behavior is unchanged.
+        //
+        // Read vendor/class from the device's config space BEFORE locking the
+        // segment's pci_bus, to avoid holding the pci_bus lock while taking the
+        // pci_device lock (lock-ordering safety).
+        let root_port_passthrough = match std::env::var("CH_ROOT_PORT_PASSTHROUGH") {
+            Ok(v) => !matches!(v.as_str(), "" | "0" | "false"),
+            Err(_) => false,
+        };
+        let is_nvidia_gpu = if root_port_passthrough {
+            let r0 = pci_device.lock().unwrap().read_config_register(0);
+            let vendor = (r0 & 0xffff) as u16;
+            let class = (pci_device.lock().unwrap().read_config_register(2) >> 24) as u8;
+            // NVIDIA vendor ID and Display controller (3D) class code.
+            vendor == 0x10de && class == 0x03
+        } else {
+            false
+        };
+
         let mut pci_bus = self.pci_segments[segment_id as usize]
             .pci_bus
             .lock()
             .unwrap();
 
-        pci_bus
-            .add_device(bdf.device(), pci_device)
-            .map_err(DeviceManagerError::AddPciDevice)?;
+        let secondary_bus = if is_nvidia_gpu {
+            pci_bus.allocate_secondary_bus()
+        } else {
+            None
+        };
+
+        if let Some(bus) = secondary_bus {
+            // Place a PCIe root port at the GPU's slot on bus 0, then place the
+            // GPU as the single endpoint on the freshly-allocated secondary bus.
+            let rp = Arc::new(Mutex::new(PciRootPort::new(
+                format!("rootport_{segment_id}_{}", bdf.device()),
+                bus,
+            )));
+            pci_bus
+                .add_device(bdf.device(), rp)
+                .map_err(DeviceManagerError::AddPciDevice)?;
+            pci_bus.add_secondary_bus_device(bus, pci_device.clone());
+            info!("Placed NVIDIA GPU {bdf} behind a PCIe root port on secondary bus {bus}");
+        } else {
+            pci_bus
+                .add_device(bdf.device(), pci_device)
+                .map_err(DeviceManagerError::AddPciDevice)?;
+        }
 
         self.bus_devices.push(Arc::clone(&bus_device));
 

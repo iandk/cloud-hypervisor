@@ -161,6 +161,17 @@ impl PciBus {
         self.secondary_buses.insert(secondary_bus, device);
     }
 
+    /// Allocate the next unused secondary bus number for a PCIe root port.
+    /// Bus 0 is the root bus, so secondary buses live in `1..8`. The upper
+    /// bound matches `arch::layout::PCI_BUSES_PER_SEGMENT` (8) and the
+    /// per-segment ECAM aperture / MCFG advertisement; it is hardcoded here
+    /// because the `pci` crate does not depend on `arch`. Returns `None` when
+    /// all secondary buses in the segment are exhausted.
+    pub fn allocate_secondary_bus(&mut self) -> Option<u8> {
+        // 1..8: buses 1 through 7 are available for root-port secondary buses.
+        (1..8).find(|bus| !self.secondary_buses.contains_key(bus))
+    }
+
     /// Resolve a config-cycle (bus, device, function) target to the owning
     /// `PciDevice`. Bus 0 selects by slot; a non-zero bus selects the single
     /// endpoint on that secondary bus (slot 0 only). Returns None for absent
