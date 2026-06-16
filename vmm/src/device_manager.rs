@@ -756,44 +756,58 @@ impl DeviceRelocation for AddressManager {
                     .map_err(io::Error::other)?;
             }
             PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
-                let pci_mmio_allocators = if region_type == PciBarRegionType::Memory32BitRegion {
-                    &self.pci_mmio32_allocators
-                } else {
-                    &self.pci_mmio64_allocators
+                // Select the source and destination allocators by ADDRESS, not by
+                // the BAR's 64-bit-ness. A 64-bit BAR may legally hold a <4 GiB
+                // address: when a non-prefetchable BAR sits behind a PCIe root
+                // port, the guest relocates it into the bridge-forwardable
+                // below-4 GiB window, which lives in the 32-bit MMIO aperture even
+                // though the BAR is a 64-bit BAR. Choosing the pool from
+                // region_type would look only in the mmio64 allocators and reject
+                // that (correct) move, leaving the device's BAR unreachable
+                // through the bridge (the H100 NVSwitch SXid 10008 failure).
+                let owning_allocator = |addr: u64| {
+                    self.pci_mmio32_allocators
+                        .iter()
+                        .chain(self.pci_mmio64_allocators.iter())
+                        .find(|allocator_mutex| {
+                            let allocator = allocator_mutex.lock().unwrap();
+                            addr >= allocator.base().0 && addr <= allocator.end().0
+                        })
+                        .cloned()
                 };
 
-                // Find the specific allocator that this BAR was allocated from and use it for a new one
-                for pci_mmio_allocator_mutex in pci_mmio_allocators {
-                    let mut pci_mmio_allocator = pci_mmio_allocator_mutex.lock().unwrap();
+                // Free old_base from whichever aperture owns it so the new
+                // allocation sees the space as available.
+                if let Some(src) = owning_allocator(old_base) {
+                    src.lock()
+                        .unwrap()
+                        .free(GuestAddress(old_base), len as GuestUsize);
+                }
 
-                    if old_base >= pci_mmio_allocator.base().0
-                        && old_base <= pci_mmio_allocator.end().0
-                    {
-                        // Free old_base first so allocate(new_base) sees it
-                        // as available; restore old_base on failure to keep
-                        // the allocator in sync with the MMIO bus.
-                        pci_mmio_allocator.free(GuestAddress(old_base), len as GuestUsize);
-                        if pci_mmio_allocator
-                            .allocate(Some(GuestAddress(new_base)), len as GuestUsize, Some(len))
+                // Allocate new_base from whichever aperture owns it (it may differ
+                // from the source aperture for a cross-aperture relocation).
+                let allocated = owning_allocator(new_base).and_then(|dst| {
+                    dst.lock().unwrap().allocate(
+                        Some(GuestAddress(new_base)),
+                        len as GuestUsize,
+                        Some(len),
+                    )
+                });
+                if allocated.is_none() {
+                    // Restore old_base in its owning aperture to keep the
+                    // allocator in sync with the (unchanged) MMIO bus mapping.
+                    if let Some(src) = owning_allocator(old_base)
+                        && src
+                            .lock()
+                            .unwrap()
+                            .allocate(Some(GuestAddress(old_base)), len as GuestUsize, Some(len))
                             .is_none()
-                        {
-                            if pci_mmio_allocator
-                                .allocate(
-                                    Some(GuestAddress(old_base)),
-                                    len as GuestUsize,
-                                    Some(len),
-                                )
-                                .is_none()
-                            {
-                                error!(
-                                    "Failed to restore old MMIO range 0x{old_base:x} after rejected move_bar"
-                                );
-                            }
-                            return Err(io::Error::other("failed allocating new MMIO range"));
-                        }
-
-                        break;
+                    {
+                        error!(
+                            "Failed to restore old MMIO range 0x{old_base:x} after rejected move_bar"
+                        );
                     }
+                    return Err(io::Error::other("failed allocating new MMIO range"));
                 }
 
                 // Update MMIO bus
@@ -4042,12 +4056,34 @@ impl DeviceManager {
             Ok(v) => !matches!(v.as_str(), "" | "0" | "false"),
             Err(_) => false,
         };
-        let is_nvidia_gpu = if root_port_passthrough {
-            let r0 = pci_device.lock().unwrap().read_config_register(0);
-            let vendor = (r0 & 0xffff) as u16;
-            let class = (pci_device.lock().unwrap().read_config_register(2) >> 24) as u8;
-            // NVIDIA vendor ID and Display controller (3D) class code.
-            vendor == 0x10de && class == 0x03
+        let needs_nvidia_root_port = if root_port_passthrough {
+            let (device_id, vendor, class) = {
+                let mut pci_device = pci_device.lock().unwrap();
+                let r0 = pci_device.read_config_register(0);
+                let r2 = pci_device.read_config_register(2);
+                (pci_device.id(), (r0 & 0xffff) as u16, (r2 >> 24) as u8)
+            };
+            // Launcher contract: GPUs are `gpu-*`, NVSwitches are `nvsw-*`.
+            let id_matches_launcher = matches!(
+                device_id.as_deref(),
+                Some(id) if id.starts_with("gpu-") || id.starts_with("nvsw-")
+            );
+            // NVIDIA vendor ID. GPUs are Display/3D controllers (class 0x03);
+            // H100 NVSwitches report class 0x06 (Bridge/other, 10de:22a3).
+            // OpenRM's cuInit topology check requires EVERY NVIDIA fabric device
+            // (GPUs AND NVSwitches) to sit behind a PCIe root port, so both must
+            // be placed on a secondary bus. The `gpu-*`/`nvsw-*` ID check matches
+            // the MMT launcher contract and gives the root-port path a
+            // deterministic fallback if early VFIO config-space reads do not
+            // expose the expected class code yet.
+            let config_matches_nvidia_device = vendor == 0x10de && matches!(class, 0x03 | 0x06);
+            if id_matches_launcher && !config_matches_nvidia_device {
+                warn!(
+                    "Treating {device_id:?} as an NVIDIA fabric device for root-port passthrough \
+                     despite config vendor=0x{vendor:04x} class=0x{class:02x}"
+                );
+            }
+            config_matches_nvidia_device || id_matches_launcher
         } else {
             false
         };
@@ -4057,7 +4093,7 @@ impl DeviceManager {
             .lock()
             .unwrap();
 
-        let secondary_bus = if is_nvidia_gpu {
+        let secondary_bus = if needs_nvidia_root_port {
             pci_bus.allocate_secondary_bus()
         } else {
             None

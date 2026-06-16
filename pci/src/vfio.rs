@@ -843,11 +843,21 @@ impl VfioCommon {
                 PciBarRegionType::IoRegion => {
                     allocator.free_io_addresses(region.start, region.length);
                 }
-                PciBarRegionType::Memory32BitRegion => {
-                    mmio32_allocator.free(region.start, region.length);
-                }
-                PciBarRegionType::Memory64BitRegion => {
-                    mmio64_allocator.free(region.start, region.length);
+                PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                    // Free from the aperture that actually owns the current
+                    // address, not the one implied by the BAR's 64-bit-ness. A
+                    // 64-bit BAR that the guest relocated into the below-4 GiB
+                    // window (e.g. an NVSwitch BAR behind a PCIe root port) lives
+                    // in the 32-bit aperture; freeing it from the 64-bit pool by
+                    // region_type would desync the allocator. region.start is kept
+                    // current by VfioPciDevice::move_bar on relocation.
+                    if region.start.0 >= mmio64_allocator.base().0
+                        && region.start.0 <= mmio64_allocator.end().0
+                    {
+                        mmio64_allocator.free(region.start, region.length);
+                    } else {
+                        mmio32_allocator.free(region.start, region.length);
+                    }
                 }
             }
         }
