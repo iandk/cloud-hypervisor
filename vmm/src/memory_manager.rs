@@ -256,6 +256,7 @@ pub struct MemoryManager {
     hugepages: bool,
     hugepage_size: Option<u64>,
     prefault: bool,
+    reserve: bool,
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
@@ -642,6 +643,8 @@ impl MemoryManager {
         let mut zone_align_size = memory_zone_get_align_size(zone)?;
         let mut zone_offset = 0u64;
         let mut memory_zones = HashMap::new();
+        // (addr, size, page_size, host_numa_node) of zone regions to prefault concurrently after the loop.
+        let mut deferred_prefault: Vec<(usize, usize, usize, Option<u32>)> = Vec::new();
 
         if !is_aligned(zone.size, zone_align_size) {
             return Err(Error::MisalignedMemorySize);
@@ -695,12 +698,14 @@ impl MemoryManager {
                     region_start.raw_value(),
                     region_size
                 );
+                let want_prefault = prefault.unwrap_or(zone.prefault);
                 let region = MemoryManager::create_ram_region(
                     &zone.file,
                     file_offset,
                     region_start,
                     region_size as usize,
-                    prefault.unwrap_or(zone.prefault),
+                    false, // prefault deferred to a concurrent cross-zone pass after the loop
+                    zone.reserve,
                     zone.shared,
                     zone.hugepages,
                     zone.hugepage_size,
@@ -708,6 +713,19 @@ impl MemoryManager {
                     None,
                     thp,
                 )?;
+                if want_prefault {
+                    let page_size = Self::get_prefault_align_size(
+                        &zone.file,
+                        zone.hugepages,
+                        zone.hugepage_size,
+                    )? as usize;
+                    deferred_prefault.push((
+                        region.as_ptr() as usize,
+                        region_size as usize,
+                        page_size,
+                        zone.host_numa_node,
+                    ));
+                }
 
                 // Add region to the list of regions associated with the
                 // current memory zone.
@@ -763,6 +781,19 @@ impl MemoryManager {
             }
         }
 
+        // Prefault every zone region CONCURRENTLY so all host NUMA memory controllers
+        // run at once. Placement is already fixed by each region's mbind, so cross-zone
+        // concurrency does not change which node a page lands on.
+        if !deferred_prefault.is_empty() {
+            thread::scope(|s| {
+                for &(addr, size, page_size, node) in &deferred_prefault {
+                    s.spawn(move || {
+                        Self::prefault_region_threaded(addr, size, page_size, node);
+                    });
+                }
+            });
+        }
+
         Ok((mem_regions, memory_zones))
     }
 
@@ -803,6 +834,7 @@ impl MemoryManager {
                         GuestAddress(guest_ram_mapping.gpa),
                         guest_ram_mapping.size as usize,
                         prefault.unwrap_or(zone_config.prefault),
+                        zone_config.reserve,
                         zone_config.shared,
                         zone_config.hugepages,
                         zone_config.hugepage_size,
@@ -1389,6 +1421,7 @@ impl MemoryManager {
                 hotplug_size: config.hotplug_size,
                 hotplugged_size: config.hotplugged_size,
                 prefault: config.prefault,
+                reserve: config.reserve,
                 mergeable: config.mergeable,
             }];
 
@@ -1623,6 +1656,7 @@ impl MemoryManager {
                                 start_addr,
                                 hotplug_size as usize,
                                 prefault.unwrap_or(zone.prefault),
+                                zone.reserve,
                                 zone.shared,
                                 zone.hugepages,
                                 zone.hugepage_size,
@@ -1736,6 +1770,7 @@ impl MemoryManager {
             hugepages: config.hugepages,
             hugepage_size: config.hugepage_size,
             prefault: config.prefault,
+            reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
             memory_zones,
@@ -1903,6 +1938,7 @@ impl MemoryManager {
         file_offset: u64,
         size: usize,
         prefault: bool,
+        reserve: bool,
         shared: bool,
         hugepages: bool,
         hugepage_size: Option<u64>,
@@ -1910,7 +1946,7 @@ impl MemoryManager {
         existing_memory_file: Option<File>,
         thp: bool,
     ) -> Result<MmapRegion<AtomicBitmap>, Error> {
-        let mut mmap_flags = libc::MAP_NORESERVE;
+        let mut mmap_flags = if reserve { 0 } else { libc::MAP_NORESERVE };
 
         // The duplication of mmap_flags ORing here is unfortunate but it also makes
         // the complexity of the handling clear.
@@ -1971,7 +2007,9 @@ impl MemoryManager {
                 .map_err(Error::ApplyNumaPolicy)?;
         }
 
-        // Prefault the region if needed, in parallel.
+        // Prefault the region if needed (threaded). create_memory_regions_from_zones
+        // passes prefault=false and runs prefault_region_threaded concurrently across
+        // zones instead, so all host NUMA nodes zero at once.
         if prefault {
             let page_size =
                 Self::get_prefault_align_size(backing_file, hugepages, hugepage_size)? as usize;
@@ -1980,37 +2018,7 @@ impl MemoryManager {
                 warn!("Prefaulting memory size {size} misaligned with page size {page_size}");
             }
 
-            let num_pages = size / page_size;
-
-            let num_threads = Self::get_prefault_num_threads(page_size, num_pages);
-
-            let pages_per_thread = num_pages / num_threads;
-            let remainder = num_pages % num_threads;
-
-            let barrier = Arc::new(Barrier::new(num_threads));
-            thread::scope(|s| {
-                let r = &region;
-                for i in 0..num_threads {
-                    let barrier = Arc::clone(&barrier);
-                    s.spawn(move || {
-                        // Wait until all threads have been spawned to avoid contention
-                        // over mmap_sem between thread stack allocation and page faulting.
-                        barrier.wait();
-                        let pages = pages_per_thread + if i < remainder { 1 } else { 0 };
-                        let offset =
-                            page_size * ((i * pages_per_thread) + std::cmp::min(i, remainder));
-                        // SAFETY: FFI call with correct arguments
-                        let ret = unsafe {
-                            let addr = r.as_ptr().add(offset);
-                            libc::madvise(addr.cast(), pages * page_size, libc::MADV_POPULATE_WRITE)
-                        };
-                        if ret != 0 {
-                            let e = io::Error::last_os_error();
-                            warn!("Failed to prefault pages: {e}");
-                        }
-                    });
-                }
-            });
+            Self::prefault_region_threaded(region.as_ptr() as usize, size, page_size, host_numa_node);
         }
 
         info!(
@@ -2040,6 +2048,7 @@ impl MemoryManager {
         start_addr: GuestAddress,
         size: usize,
         prefault: bool,
+        reserve: bool,
         shared: bool,
         hugepages: bool,
         hugepage_size: Option<u64>,
@@ -2052,6 +2061,7 @@ impl MemoryManager {
             file_offset,
             size,
             prefault,
+            reserve,
             shared,
             hugepages,
             hugepage_size,
@@ -2063,6 +2073,102 @@ impl MemoryManager {
         Ok(Arc::new(GuestRegionMmap::new(r, start_addr).ok_or(
             Error::GuestMemory(MmapError::InvalidGuestAddress(start_addr)),
         )?))
+    }
+
+    // CPUs local to a host NUMA node (parses /sys .../cpulist e.g. "0-12,104-116").
+    fn numa_node_cpus(node: u32) -> Vec<usize> {
+        let mut cpus = Vec::new();
+        if let Ok(s) = std::fs::read_to_string(format!(
+            "/sys/devices/system/node/node{node}/cpulist"
+        )) {
+            for part in s.trim().split(',') {
+                if part.is_empty() {
+                    continue;
+                }
+                if let Some((a, b)) = part.split_once('-') {
+                    if let (Ok(a), Ok(b)) =
+                        (a.trim().parse::<usize>(), b.trim().parse::<usize>())
+                    {
+                        for c in a..=b {
+                            cpus.push(c);
+                        }
+                    }
+                } else if let Ok(a) = part.trim().parse::<usize>() {
+                    cpus.push(a);
+                }
+            }
+        }
+        cpus
+    }
+
+    // Prefault one already-mmap'd, NUMA-bound region with MADV_POPULATE_WRITE,
+    // sharded across get_prefault_num_threads() threads. Split out of
+    // create_ram_region_raw so create_memory_regions_from_zones can run every
+    // zone's prefault CONCURRENTLY: inline per-region prefault zeroed one host
+    // NUMA node at a time, leaving the other memory controllers idle (~21 GB/s on
+    // an 888G VM ~ 42s vs a few s when all nodes zero at once).
+    fn prefault_region_threaded(addr: usize, size: usize, page_size: usize, node: Option<u32>) {
+        let num_pages = size / page_size;
+        if num_pages == 0 {
+            return;
+        }
+        let num_threads = Self::get_prefault_num_threads(page_size, num_pages);
+        let pages_per_thread = num_pages / num_threads;
+        let remainder = num_pages % num_threads;
+        // Pin workers to the region's NUMA-node CPUs so the zeroing writes are
+        // node-local (mbind already fixes page placement; this fixes write bandwidth).
+        let node_cpus: Vec<usize> = node.map(Self::numa_node_cpus).unwrap_or_default();
+        let barrier = Arc::new(Barrier::new(num_threads));
+        thread::scope(|s| {
+            let node_cpus = &node_cpus;
+            for i in 0..num_threads {
+                let barrier = Arc::clone(&barrier);
+                s.spawn(move || {
+                    if !node_cpus.is_empty() {
+                        // SAFETY: FFI; set is zeroed then filled with valid cpu ids.
+                        unsafe {
+                            let mut set: libc::cpu_set_t = std::mem::zeroed();
+                            libc::CPU_ZERO(&mut set);
+                            for &c in node_cpus {
+                                if c < libc::CPU_SETSIZE as usize {
+                                    libc::CPU_SET(c, &mut set);
+                                }
+                            }
+                            if libc::sched_setaffinity(
+                                0,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                &set,
+                            ) != 0
+                            {
+                                warn!(
+                                    "prefault: sched_setaffinity failed: {}",
+                                    io::Error::last_os_error()
+                                );
+                            }
+                        }
+                    }
+                    // Wait until all threads have spawned to avoid mmap_sem contention
+                    // between thread stack allocation and page faulting.
+                    barrier.wait();
+                    let pages = pages_per_thread + if i < remainder { 1 } else { 0 };
+                    let offset =
+                        page_size * ((i * pages_per_thread) + std::cmp::min(i, remainder));
+                    // SAFETY: FFI call; [addr, addr+size) is a valid mmap'd range and
+                    // the per-thread slices are disjoint.
+                    let ret = unsafe {
+                        libc::madvise(
+                            (addr as *mut u8).add(offset).cast(),
+                            pages * page_size,
+                            libc::MADV_POPULATE_WRITE,
+                        )
+                    };
+                    if ret != 0 {
+                        let e = io::Error::last_os_error();
+                        warn!("Failed to prefault pages: {e}");
+                    }
+                });
+            }
+        });
     }
 
     // Duplicate of `memory_zone_get_align_size` that does not require a `zone`
@@ -2167,6 +2273,7 @@ impl MemoryManager {
             start_addr,
             size,
             self.prefault,
+            self.reserve,
             self.shared,
             self.hugepages,
             self.hugepage_size,
