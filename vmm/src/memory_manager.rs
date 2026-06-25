@@ -643,7 +643,7 @@ impl MemoryManager {
         let mut zone_align_size = memory_zone_get_align_size(zone)?;
         let mut zone_offset = 0u64;
         let mut memory_zones = HashMap::new();
-        // (addr, size, page_size) of zone regions to prefault concurrently after the loop.
+        // (addr, size, page_size, host_numa_node) of zone regions to prefault concurrently after the loop.
         let mut deferred_prefault: Vec<(usize, usize, usize, Option<u32>)> = Vec::new();
 
         if !is_aligned(zone.size, zone_align_size) {
@@ -2075,13 +2075,6 @@ impl MemoryManager {
         )?))
     }
 
-    // Duplicate of `memory_zone_get_align_size` that does not require a `zone`
-    // Prefault one already-mmap'd, NUMA-bound region with MADV_POPULATE_WRITE,
-    // sharded across get_prefault_num_threads() threads. Split out of
-    // create_ram_region_raw so create_memory_regions_from_zones can run every
-    // zone's prefault CONCURRENTLY: inline per-region prefault zeroed one host
-    // NUMA node at a time, leaving the other memory controllers idle (~21 GB/s on
-    // an 888G VM ~ 42s vs a few s when all nodes zero at once).
     // CPUs local to a host NUMA node (parses /sys .../cpulist e.g. "0-12,104-116").
     fn numa_node_cpus(node: u32) -> Vec<usize> {
         let mut cpus = Vec::new();
@@ -2108,6 +2101,12 @@ impl MemoryManager {
         cpus
     }
 
+    // Prefault one already-mmap'd, NUMA-bound region with MADV_POPULATE_WRITE,
+    // sharded across get_prefault_num_threads() threads. Split out of
+    // create_ram_region_raw so create_memory_regions_from_zones can run every
+    // zone's prefault CONCURRENTLY: inline per-region prefault zeroed one host
+    // NUMA node at a time, leaving the other memory controllers idle (~21 GB/s on
+    // an 888G VM ~ 42s vs a few s when all nodes zero at once).
     fn prefault_region_threaded(addr: usize, size: usize, page_size: usize, node: Option<u32>) {
         let num_pages = size / page_size;
         if num_pages == 0 {
@@ -2135,11 +2134,17 @@ impl MemoryManager {
                                     libc::CPU_SET(c, &mut set);
                                 }
                             }
-                            libc::sched_setaffinity(
+                            if libc::sched_setaffinity(
                                 0,
                                 std::mem::size_of::<libc::cpu_set_t>(),
                                 &set,
-                            );
+                            ) != 0
+                            {
+                                warn!(
+                                    "prefault: sched_setaffinity failed: {}",
+                                    io::Error::last_os_error()
+                                );
+                            }
                         }
                     }
                     // Wait until all threads have spawned to avoid mmap_sem contention
@@ -2166,6 +2171,7 @@ impl MemoryManager {
         });
     }
 
+    // Duplicate of `memory_zone_get_align_size` that does not require a `zone`
     fn get_prefault_align_size(
         backing_file: &Option<PathBuf>,
         hugepages: bool,
