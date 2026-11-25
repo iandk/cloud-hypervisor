@@ -157,6 +157,7 @@ mod tests {
     use crate::formats::qcow;
     use crate::formats::qcow::common::apply_dealloc_action;
     use crate::formats::qcow::common::tests::compress_allocated_clusters;
+    use crate::formats::qcow::header::DEFAULT_CLUSTER_BITS;
     use crate::formats::qcow::metadata::{ClusterReadMapping, DeallocAction};
     use crate::formats::qcow::{
         BackingFileConfig, Error as QcowError, ImageType, QcowDisk, QcowHeader, QcowTempDisk,
@@ -244,6 +245,7 @@ mod tests {
         file_size: u64,
         value: u8,
         direct_io: bool,
+        cluster_bits: u32,
     ) -> (TempFile, TempFile, QcowDisk) {
         let backing_temp = TempFile::new().unwrap();
         let backing_data = vec![value; file_size as usize];
@@ -255,9 +257,16 @@ mod tests {
             path: backing_path,
             format: Some(ImageType::Raw),
         };
-        let overlay_temp = QcowTempDisk::new(file_size, Some(&backing_config), false, true, false)
-            .unwrap()
-            .into_tempfile();
+        let overlay_temp = QcowTempDisk::new_with_cluster_bits(
+            file_size,
+            Some(&backing_config),
+            false,
+            true,
+            false,
+            cluster_bits,
+        )
+        .unwrap()
+        .into_tempfile();
 
         let disk = QcowDisk::new(
             overlay_temp.as_file().try_clone().unwrap(),
@@ -1094,11 +1103,15 @@ mod tests {
     }
 
     fn test_write_zeroes_unallocated_overlay_with_backing_must_read_zero_impl(direct_io: bool) {
-        let cluster_size = 1u64 << 16;
+        let cluster_size = 1u64 << DEFAULT_CLUSTER_BITS;
         let file_size = cluster_size * 4;
         let offset = cluster_size;
-        let (_backing_temp, _overlay_temp, disk) =
-            create_overlay_disk_with_raw_backing_pattern(file_size, 0xAB, direct_io);
+        let (_backing_temp, _overlay_temp, disk) = create_overlay_disk_with_raw_backing_pattern(
+            file_size,
+            0xAB,
+            direct_io,
+            DEFAULT_CLUSTER_BITS,
+        );
 
         let mut async_io = disk.create_async_io(1).unwrap();
         async_io.write_zeroes(offset, cluster_size, 42).unwrap();
@@ -1126,14 +1139,15 @@ mod tests {
 
     fn test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_impl(
         direct_io: bool,
+        cluster_bits: u32,
     ) {
-        let cluster_size = 1u64 << 16;
+        let cluster_size = 1u64 << cluster_bits;
         let file_size = cluster_size * 4;
         let offset = cluster_size;
         let patch_offset = 0x4000usize;
         let patch_len = 0x1000usize;
         let (_backing_temp, _overlay_temp, disk) =
-            create_overlay_disk_with_raw_backing_pattern(file_size, 0xAB, direct_io);
+            create_overlay_disk_with_raw_backing_pattern(file_size, 0xAB, direct_io, cluster_bits);
 
         let mut async_io = disk.create_async_io(1).unwrap();
         async_io.write_zeroes(offset, cluster_size, 42).unwrap();
@@ -1156,13 +1170,26 @@ mod tests {
 
     #[test]
     fn test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data() {
-        test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_impl(false);
+        test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_impl(
+            false,
+            DEFAULT_CLUSTER_BITS,
+        );
     }
 
     #[test]
     fn test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_direct_io() {
         require_direct_io!();
-        test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_impl(true);
+        test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_impl(
+            true,
+            DEFAULT_CLUSTER_BITS,
+        );
+    }
+
+    // The patch fills a small part of a 1 MiB cluster. All the bytes around
+    // it must come from the zero flag, not the backing file.
+    #[test]
+    fn test_partial_write_after_write_zeroes_large_cluster_must_not_reintroduce_backing_data() {
+        test_partial_write_after_write_zeroes_must_not_reintroduce_backing_data_impl(false, 20);
     }
 
     fn test_backing_file_read_qcow2_backing_impl(direct_io: bool) {
